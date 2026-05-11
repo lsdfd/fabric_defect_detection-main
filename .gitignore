@@ -1,0 +1,18 @@
+models/unet_seg_200epoch.pt
+
+# Local environment notes / secrets
+*.local
+*.local.md
+.env
+.env.*
+!.env.example
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Experiment outputs
+outputs/
+
+# macOS noise
+.DS_Store
