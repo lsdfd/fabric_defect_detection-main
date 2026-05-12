@@ -37,11 +37,11 @@ class BinaryClassifier(nn.Module):
 
 
 class OpticalStudentClassifier(nn.Module):
-    """One-convolution optical frontend plus a small electronic FC backend.
+    """One optical-style convolution followed by two fully-connected layers.
 
-    The convolution is the future optical kernel bank. Adaptive pooling keeps the
-    backend size close to the reference optical encoder papers, where the digital
-    backend receives compact feature maps from a single optical convolution layer.
+    This mirrors the compressed student in the reference optical encoder paper:
+    a single convolutional frontend whose kernels are future PSF targets, followed
+    by a lightweight digital readout head.
     """
 
     def __init__(
@@ -51,11 +51,15 @@ class OpticalStudentClassifier(nn.Module):
         kernel_size: int = 7,
         pooled_size: int = 6,
         hidden_dim: int = 256,
+        optical_activation: str = "relu",
     ):
         super().__init__()
         if kernel_size % 2 == 0:
             raise ValueError("kernel_size should be odd so same-padding is symmetric.")
+        if optical_activation not in {"relu", "identity"}:
+            raise ValueError("optical_activation must be 'relu' or 'identity'.")
 
+        self.optical_activation = optical_activation
         self.optical = nn.Conv2d(
             in_channels,
             optical_kernels,
@@ -73,7 +77,8 @@ class OpticalStudentClassifier(nn.Module):
 
     def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
         x = self.optical(x)
-        x = torch.relu(x)
+        if self.optical_activation == "relu":
+            x = torch.relu(x)
         x = self.pool(x)
         return self.backend(x)
 

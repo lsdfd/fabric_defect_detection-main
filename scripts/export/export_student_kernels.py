@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kernel-size", type=int, default=7)
     parser.add_argument("--pooled-size", type=int, default=6)
     parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--optical-activation", choices=["relu", "identity"], default="relu")
     return parser.parse_args()
 
 
@@ -31,6 +32,7 @@ def main() -> None:
         kernel_size=args.kernel_size,
         pooled_size=args.pooled_size,
         hidden_dim=args.hidden_dim,
+        optical_activation=args.optical_activation,
     )
     model.load_state_dict(torch.load(args.checkpoint, map_location="cpu"))
     kernels = model.optical_kernels().numpy()
