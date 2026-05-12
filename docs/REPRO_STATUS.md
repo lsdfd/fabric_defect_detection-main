@@ -42,5 +42,5 @@
 
 1. 固定 binary teacher 复现链路。
 2. 补齐 U-Net 同口径评估。
-3. 进入一层 CNN student 的 baseline 和 KD。
+3. 进入一层 CNN student 的 baseline 和 classic KD。
 4. 再进入卷积核导出与超表面相位设计适配。

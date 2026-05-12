@@ -85,6 +85,7 @@ student KD：
 
 ```bash
 python scripts/training/train_student_kd.py \
+  --mode kd \
   --teacher-checkpoint models/bigger_binary_F1_0.98.pth
 ```
 

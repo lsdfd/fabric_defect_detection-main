@@ -28,7 +28,10 @@
 - `scripts/training/train_teacher.py`
   - 当原 teacher 权重只有 Git LFS 指针文件时，重新训练原始 `BinaryClassifier`。
 - `scripts/training/train_student_kd.py`
-  - 训练一层 CNN student，包含 task loss + distillation loss。
+  - 训练一层 CNN student。
+  - 支持 `baseline` 和 `kd` 两种模式。
+- `scripts/evaluation/evaluate_student.py`
+  - 单独评估 student checkpoint。
 - `scripts/export/export_student_kernels.py`
   - 导出 student 第一层 CNN kernels，并拆成 positive/negative。
 
@@ -70,11 +73,26 @@ python scripts/evaluation/evaluate_teacher.py
 models/bigger_binary_F1_0.98.pth
 ```
 
+## 训练 Student Baseline
+
+```bash
+cd fabric_defect_detection-main
+python scripts/training/train_student_kd.py \
+  --mode baseline \
+  --epochs 10 \
+  --batch-size 16 \
+  --optical-kernels 16 \
+  --kernel-size 7 \
+  --pooled-size 6 \
+  --hidden-dim 256
+```
+
 ## 训练 KD Student
 
 ```bash
 cd fabric_defect_detection-main
 python scripts/training/train_student_kd.py \
+  --mode kd \
   --teacher-checkpoint outputs/teacher/binary_classifier_best.pt \
   --epochs 10 \
   --batch-size 16 \
@@ -86,17 +104,27 @@ python scripts/training/train_student_kd.py \
   --temperature 2.0
 ```
 
-输出默认写入：
+输出默认会按实验配置自动写入，例如：
 
 ```text
-outputs/student_kd/
+outputs/student_baseline_k16_s7_p6_h256/
+outputs/student_kd_k16_s7_p6_h256/
 ```
 
 包括：
 
 - `student_best.pt`
+- `student_last.pt`
 - `student_optical_kernels.pt`
 - `history.json`
+
+## 评估 Student
+
+```bash
+cd fabric_defect_detection-main
+python scripts/evaluation/evaluate_student.py \
+  --checkpoint outputs/student_kd_k16_s7_p6_h256/student_best.pt
+```
 
 ## 导出 Kernels
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -14,14 +15,15 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from fdd.data import AITEXPatchDataset, make_balanced_sampler, make_splits, resolve_aitex_dir
 from fdd.models import OpticalStudentClassifier, load_teacher
-from fdd.training import binary_metrics_from_probs, distillation_loss
+from fdd.training import baseline_student_loss, binary_metrics_from_probs, distillation_loss
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a one-convolution optical student with KD.")
+    parser = argparse.ArgumentParser(description="Train a one-convolution student baseline or KD model.")
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     parser.add_argument("--teacher-checkpoint", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--mode", choices=["baseline", "kd"], default="kd")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -33,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-balanced-sampler", action="store_true")
+    parser.add_argument("--num-workers", type=int, default=0)
     return parser.parse_args()
 
 
@@ -67,10 +70,13 @@ def main() -> None:
 
     project_root = args.project_root
     checkpoint = args.teacher_checkpoint
-    if checkpoint is None:
-        trained_teacher = project_root / "outputs" / "teacher" / "binary_classifier_best.pt"
-        checkpoint = trained_teacher if trained_teacher.exists() else project_root / "models" / "bigger_binary_F1_0.98.pth"
-    output_dir = args.output_dir or project_root / "outputs" / "student_kd"
+    if args.mode == "kd":
+        if checkpoint is None:
+            trained_teacher = project_root / "outputs" / "teacher" / "binary_classifier_best.pt"
+            checkpoint = trained_teacher if trained_teacher.exists() else project_root / "models" / "bigger_binary_F1_0.98.pth"
+    output_dir = args.output_dir or project_root / "outputs" / (
+        f"student_{args.mode}_k{args.optical_kernels}_s{args.kernel_size}_p{args.pooled_size}_h{args.hidden_dim}"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     transform = transforms.Compose([transforms.Resize((224, 224))])
@@ -82,10 +88,11 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=sampler is None,
         sampler=sampler,
+        num_workers=args.num_workers,
     )
-    val_loader = DataLoader(splits.val, batch_size=args.batch_size, shuffle=False)
+    val_loader = DataLoader(splits.val, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    teacher = load_teacher(str(checkpoint), device=device)
+    teacher = load_teacher(str(checkpoint), device=device) if args.mode == "kd" else None
     student = OpticalStudentClassifier(
         optical_kernels=args.optical_kernels,
         kernel_size=args.kernel_size,
@@ -96,39 +103,46 @@ def main() -> None:
 
     history = []
     best_f1 = -1.0
+    started_at = time.time()
     for epoch in range(1, args.epochs + 1):
         student.train()
         running = {"total": 0.0, "task": 0.0, "kd": 0.0}
+        epoch_started = time.time()
         for images, labels in train_loader:
             images = images.to(device)
             labels = labels.to(device).view(-1, 1)
-            with torch.no_grad():
-                teacher_probs = teacher(images)
             student_logits = student.forward_logits(images)
-            loss, task_loss, kd_loss = distillation_loss(
-                student_logits,
-                labels,
-                teacher_probs,
-                alpha=args.alpha,
-                temperature=args.temperature,
-            )
+            if args.mode == "kd":
+                with torch.no_grad():
+                    teacher_probs = teacher(images)
+                breakdown = distillation_loss(
+                    student_logits,
+                    labels,
+                    teacher_probs,
+                    alpha=args.alpha,
+                    temperature=args.temperature,
+                )
+            else:
+                breakdown = baseline_student_loss(student_logits, labels)
 
             optimizer.zero_grad()
-            loss.backward()
+            breakdown.total.backward()
             optimizer.step()
 
             batch_size = images.size(0)
-            running["total"] += loss.item() * batch_size
-            running["task"] += task_loss.item() * batch_size
-            running["kd"] += kd_loss.item() * batch_size
+            running["total"] += breakdown.total.item() * batch_size
+            running["task"] += breakdown.task.item() * batch_size
+            running["kd"] += breakdown.kd.item() * batch_size
 
         train_count = len(splits.train)
         val_metrics = evaluate(student, val_loader, device)
         row = {
             "epoch": epoch,
+            "mode": args.mode,
             "train_total_loss": running["total"] / train_count,
             "train_task_loss": running["task"] / train_count,
             "train_kd_loss": running["kd"] / train_count,
+            "epoch_seconds": time.time() - epoch_started,
             "val": val_metrics.__dict__,
         }
         history.append(row)
@@ -139,7 +153,17 @@ def main() -> None:
             torch.save(student.state_dict(), output_dir / "student_best.pt")
             torch.save(student.optical_kernels(), output_dir / "student_optical_kernels.pt")
 
-    (output_dir / "history.json").write_text(json.dumps(history, indent=2, ensure_ascii=False))
+    torch.save(student.state_dict(), output_dir / "student_last.pt")
+    result = {
+        "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
+        "teacher_checkpoint": str(checkpoint) if checkpoint is not None else None,
+        "history": history,
+        "best_val_f1": best_f1,
+        "total_seconds": time.time() - started_at,
+        "best_checkpoint": str(output_dir / "student_best.pt"),
+        "last_checkpoint": str(output_dir / "student_last.pt"),
+    }
+    (output_dir / "history.json").write_text(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

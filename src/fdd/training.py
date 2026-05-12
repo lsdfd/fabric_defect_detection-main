@@ -15,6 +15,13 @@ class BinaryMetrics:
     f1: float
 
 
+@dataclass
+class DistillationBreakdown:
+    total: torch.Tensor
+    task: torch.Tensor
+    kd: torch.Tensor
+
+
 def binary_metrics_from_probs(probs: torch.Tensor, labels: torch.Tensor, loss: torch.Tensor) -> BinaryMetrics:
     preds = (probs >= 0.5).float()
     labels = labels.float()
@@ -41,7 +48,7 @@ def distillation_loss(
     teacher_probs: torch.Tensor,
     alpha: float,
     temperature: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> DistillationBreakdown:
     """Binary KD loss: supervised BCE plus softened teacher probability matching."""
 
     labels = labels.float().view_as(student_logits)
@@ -55,5 +62,11 @@ def distillation_loss(
     kd_loss = kd_loss * (temperature**2)
 
     total = alpha * task_loss + (1 - alpha) * kd_loss
-    return total, task_loss, kd_loss
+    return DistillationBreakdown(total=total, task=task_loss, kd=kd_loss)
 
+
+def baseline_student_loss(student_logits: torch.Tensor, labels: torch.Tensor) -> DistillationBreakdown:
+    labels = labels.float().view_as(student_logits)
+    task_loss = F.binary_cross_entropy_with_logits(student_logits, labels)
+    zero = torch.zeros_like(task_loss)
+    return DistillationBreakdown(total=task_loss, task=task_loss, kd=zero)
