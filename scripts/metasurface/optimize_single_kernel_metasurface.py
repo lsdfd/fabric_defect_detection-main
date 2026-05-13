@@ -148,43 +148,53 @@ def save_preview(output_dir: Path, target: np.ndarray, simulated: np.ndarray, ph
     plt.close(fig)
 
 
-def main() -> None:
-    args = parse_args()
-    device = choose_device(args.device)
-
-    target_package = np.load(args.stage1_dir / "stage1_targets.npz")
-    summary_path = args.stage1_dir / "stage1_summary.json"
+def optimize_stage1_target(
+    stage1_dir: Path,
+    target_name: str,
+    iterations: int,
+    lr: float,
+    radius_min_um: float,
+    radius_max_um: float,
+    wavelength_nm: float,
+    grid_pitch_nm: float,
+    detector_distance_mm: float,
+    device_arg: str,
+    roi_size: int,
+) -> dict:
+    device = choose_device(device_arg)
+    target_package = np.load(stage1_dir / "stage1_targets.npz")
+    summary_path = stage1_dir / "stage1_summary.json"
     summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
 
-    if args.target == "positive":
+    if target_name == "positive":
         target_np = target_package["positive_target"].astype(np.float32)
         backphase_np = target_package["positive_backphase"].astype(np.float32)
     else:
         target_np = target_package["negative_target"].astype(np.float32)
         backphase_np = target_package["negative_backphase"].astype(np.float32)
 
-    roi_bounds = centered_roi_bounds(target_np, args.roi_size)
+    roi_bounds = centered_roi_bounds(target_np, roi_size)
     target_roi_np = crop_array(target_np, roi_bounds)
     backphase_roi_np = crop_array(backphase_np, roi_bounds)
 
     init_radius_np = initialize_radius_from_backphase(
         backphase_roi_np,
-        radius_min_um=args.radius_min_um,
-        radius_max_um=args.radius_max_um,
+        radius_min_um=radius_min_um,
+        radius_max_um=radius_max_um,
     )
 
     radius = torch.tensor(init_radius_np, dtype=torch.float32, device=device, requires_grad=True)
     target = torch.tensor(target_roi_np, dtype=torch.float32, device=device)
-    optimizer = torch.optim.Adam([radius], lr=args.lr)
+    optimizer = torch.optim.Adam([radius], lr=lr)
 
-    wavelength_m = args.wavelength_nm * 1e-9
-    grid_pitch_m = args.grid_pitch_nm * 1e-9
-    detector_distance_m = args.detector_distance_mm * 1e-3
+    wavelength_m = wavelength_nm * 1e-9
+    grid_pitch_m = grid_pitch_nm * 1e-9
+    detector_distance_m = detector_distance_mm * 1e-3
 
     losses: list[float] = []
-    for _ in range(args.iterations):
+    for _ in range(iterations):
         optimizer.zero_grad()
-        radius_clamped = torch.clamp(radius, args.radius_min_um, args.radius_max_um)
+        radius_clamped = torch.clamp(radius, radius_min_um, radius_max_um)
         phase = phase_radians_from_radius(radius_clamped)
         field = torch.exp(1j * phase.to(torch.complex64))
         propagated = propagate_angular_spectrum(field, wavelength_m, detector_distance_m, grid_pitch_m, grid_pitch_m)
@@ -196,7 +206,7 @@ def main() -> None:
         optimizer.step()
         losses.append(float(loss.item()))
 
-    radius_final = torch.clamp(radius.detach(), args.radius_min_um, args.radius_max_um)
+    radius_final = torch.clamp(radius.detach(), radius_min_um, radius_max_um)
     phase_final = phase_radians_from_radius(radius_final).detach()
     field_final = torch.exp(1j * phase_final.to(torch.complex64))
     propagated_final = propagate_angular_spectrum(field_final, wavelength_m, detector_distance_m, grid_pitch_m, grid_pitch_m)
@@ -206,7 +216,7 @@ def main() -> None:
     full_radius = embed_array(radius_final.cpu().numpy().astype(np.float32), target_np.shape, roi_bounds)
     full_init_radius = embed_array(init_radius_np.astype(np.float32), target_np.shape, roi_bounds)
 
-    output_dir = args.stage1_dir / f"optimized_{args.target}"
+    output_dir = stage1_dir / f"optimized_{target_name}"
     output_dir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_dir / "optimized_result.npz",
@@ -230,19 +240,37 @@ def main() -> None:
     )
 
     result_summary = {
-        "target": args.target,
-        "iterations": args.iterations,
-        "learning_rate": args.lr,
+        "target": target_name,
+        "iterations": iterations,
+        "learning_rate": lr,
         "device": str(device),
         "final_loss": losses[-1],
-        "roi_size": args.roi_size,
+        "roi_size": roi_size,
         "roi_bounds": [int(v) for v in roi_bounds],
-        "wavelength_nm": args.wavelength_nm,
-        "grid_pitch_nm": args.grid_pitch_nm,
-        "detector_distance_mm": args.detector_distance_mm,
+        "wavelength_nm": wavelength_nm,
+        "grid_pitch_nm": grid_pitch_nm,
+        "detector_distance_mm": detector_distance_mm,
         "stage1_summary": summary,
     }
     (output_dir / "result_summary.json").write_text(json.dumps(result_summary, indent=2, ensure_ascii=False))
+    return result_summary
+
+
+def main() -> None:
+    args = parse_args()
+    result_summary = optimize_stage1_target(
+        stage1_dir=args.stage1_dir,
+        target_name=args.target,
+        iterations=args.iterations,
+        lr=args.lr,
+        radius_min_um=args.radius_min_um,
+        radius_max_um=args.radius_max_um,
+        wavelength_nm=args.wavelength_nm,
+        grid_pitch_nm=args.grid_pitch_nm,
+        detector_distance_mm=args.detector_distance_mm,
+        device_arg=args.device,
+        roi_size=args.roi_size,
+    )
     print(json.dumps(result_summary, ensure_ascii=False, indent=2))
 
 
