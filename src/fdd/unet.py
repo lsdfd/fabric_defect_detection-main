@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -108,6 +110,14 @@ class NotebookUNet(nn.Module):
         return self.last_conv(x)
 
 
+@dataclass
+class SegmentationDistillationBreakdown:
+    total: torch.Tensor
+    task: torch.Tensor
+    kd: torch.Tensor
+    ntkd: torch.Tensor
+
+
 def segmentation_metrics(logits: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5) -> tuple[torch.Tensor, torch.Tensor]:
     preds = (torch.sigmoid(logits).view(logits.size(0), -1) > threshold).float()
     true = (targets.view(targets.size(0), -1) > threshold).float()
@@ -153,3 +163,58 @@ def notebook_deploy_iou(logits: torch.Tensor, targets: torch.Tensor, threshold: 
     intersection = (pred * true).sum(dim=1)
     union = ((pred + true) > 0).float().sum(dim=1)
     return intersection / union.clamp_min(1e-12)
+
+
+def pooled_ntk_tokens(logits: torch.Tensor, pooled_size: int) -> torch.Tensor:
+    pooled = F.adaptive_avg_pool2d(logits, (pooled_size, pooled_size))
+    return pooled.flatten(1)
+
+
+def token_gram_matrix(tokens: torch.Tensor) -> torch.Tensor:
+    normalized = F.normalize(tokens, p=2, dim=1, eps=1e-12)
+    return normalized @ normalized.transpose(0, 1)
+
+
+def segmentation_baseline_loss(
+    student_logits: torch.Tensor,
+    targets: torch.Tensor,
+    criterion: nn.Module,
+) -> SegmentationDistillationBreakdown:
+    task_loss = criterion(student_logits, targets)
+    zero = torch.zeros_like(task_loss)
+    return SegmentationDistillationBreakdown(total=task_loss, task=task_loss, kd=zero, ntkd=zero)
+
+
+def segmentation_distillation_loss(
+    student_logits: torch.Tensor,
+    targets: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    criterion: nn.Module,
+    alpha: float,
+    beta: float,
+    temperature: float = 1.0,
+    kd_mode: str = "logit",
+    ntkd_weight: float = 0.0,
+    ntkd_pooled_size: int = 8,
+) -> SegmentationDistillationBreakdown:
+    task_loss = criterion(student_logits, targets)
+
+    teacher_logits = teacher_logits.detach()
+    if kd_mode == "logit":
+        kd_loss = F.mse_loss(student_logits / temperature, teacher_logits / temperature) * (temperature**2)
+    elif kd_mode == "prob":
+        kd_loss = F.mse_loss(torch.sigmoid(student_logits / temperature), torch.sigmoid(teacher_logits / temperature))
+    else:
+        raise ValueError(f"Unsupported kd_mode: {kd_mode}")
+
+    if ntkd_weight > 0:
+        student_tokens = pooled_ntk_tokens(student_logits, ntkd_pooled_size)
+        teacher_tokens = pooled_ntk_tokens(teacher_logits, ntkd_pooled_size)
+        student_gram = token_gram_matrix(student_tokens)
+        teacher_gram = token_gram_matrix(teacher_tokens)
+        ntkd_loss = F.mse_loss(student_gram, teacher_gram)
+    else:
+        ntkd_loss = torch.zeros_like(task_loss)
+
+    total = alpha * task_loss + beta * kd_loss + ntkd_weight * ntkd_loss
+    return SegmentationDistillationBreakdown(total=total, task=task_loss, kd=kd_loss, ntkd=ntkd_loss)

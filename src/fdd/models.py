@@ -89,6 +89,59 @@ class OpticalStudentClassifier(nn.Module):
         return self.optical.weight.detach().cpu()
 
 
+class OpticalSegmentationStudent(nn.Module):
+    """Optical-style segmentation student with a minimal electronic readout head."""
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        optical_kernels: int = 32,
+        kernel_size: int = 5,
+        backend_channels: int = 16,
+    ):
+        super().__init__()
+        if kernel_size % 2 == 0:
+            raise ValueError("kernel_size should be odd so same-padding is symmetric.")
+
+        self.optical = nn.Conv2d(
+            in_channels,
+            optical_kernels,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            bias=False,
+        )
+        self.backend = nn.Sequential(
+            nn.Conv2d(optical_kernels, backend_channels, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(backend_channels, backend_channels, kernel_size=3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(backend_channels, 1, kernel_size=1, bias=True),
+        )
+
+    def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backend(self.optical(x))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.forward_logits(x))
+
+    def optical_kernels(self) -> torch.Tensor:
+        return self.optical.weight.detach().cpu()
+
+
+def load_unet_teacher(checkpoint_path: str, device: torch.device) -> nn.Module:
+    from fdd.unet import NotebookUNet
+
+    model = NotebookUNet().to(device)
+    try:
+        state = torch.load(checkpoint_path, map_location=device)
+    except Exception:
+        state = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
+
 def load_teacher(checkpoint_path: str, device: torch.device) -> BinaryClassifier:
     model = BinaryClassifier().to(device)
     try:

@@ -4,9 +4,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-import cv2
 import numpy as np
 import torch
+from PIL import Image, ImageOps
 from torch.utils.data import Dataset, Subset, random_split
 from torch.utils.data.sampler import WeightedRandomSampler
 
@@ -37,8 +37,8 @@ class AITEXPatchDataset(Dataset):
         defect_dir = self.aitex_dir / "Defect_images"
         mask_dir = self.aitex_dir / "Mask_images"
 
-        self.normal_images = sorted(normal_dir.rglob("*.png"))
-        self.defect_masks = sorted(mask_dir.rglob("*_mask.png"))
+        self.normal_images = sorted(path for path in normal_dir.rglob("*.png") if not self._is_artifact(path))
+        self.defect_masks = sorted(path for path in mask_dir.rglob("*_mask.png") if not self._is_artifact(path))
         self.mask_roots = [mask.name.removesuffix("_mask.png") for mask in self.defect_masks]
         self.defect_images = [defect_dir / f"{root}.png" for root in self.mask_roots]
 
@@ -47,17 +47,8 @@ class AITEXPatchDataset(Dataset):
             raise FileNotFoundError(f"Missing defect images for masks: {missing[:5]}")
 
         self.image_paths = [*self.normal_images, *self.defect_images]
-        read_mode = cv2.IMREAD_GRAYSCALE if greyscale else cv2.IMREAD_COLOR
-        self.images = [cv2.imread(str(path), read_mode) for path in self.image_paths]
-        if any(image is None for image in self.images):
-            bad = [str(path) for path, image in zip(self.image_paths, self.images) if image is None]
-            raise ValueError(f"Could not read images: {bad[:5]}")
-
         normal_masks = [np.zeros(self.image_dims, dtype=np.uint8) for _ in self.normal_images]
-        defect_masks = [
-            cv2.threshold(cv2.imread(str(path), cv2.IMREAD_GRAYSCALE), 0, 1, cv2.THRESH_BINARY)[1]
-            for path in self.defect_masks
-        ]
+        defect_masks = [self._load_mask(path) for path in self.defect_masks]
         self.masks = [*normal_masks, *defect_masks]
 
         self.patches: list[torch.Tensor] = []
@@ -65,10 +56,9 @@ class AITEXPatchDataset(Dataset):
         self.source_paths: list[str] = []
         self.patch_indices: list[int] = []
 
-        for image_path, image, mask in zip(self.image_paths, self.images, self.masks):
-            image_resized = cv2.resize(image, (4096, 256))
-            image_resized = cv2.equalizeHist(image_resized) / 255.0
-            mask_resized = cv2.resize(mask, (4096, 256))
+        for image_path, mask in zip(self.image_paths, self.masks):
+            image_resized = self._load_image(image_path)
+            mask_resized = self._resize_mask(mask)
 
             for patch_idx, start in enumerate(range(0, 4096, self.patch_size)):
                 image_patch = image_resized[:, start : start + self.patch_size]
@@ -86,6 +76,75 @@ class AITEXPatchDataset(Dataset):
         if self.transform is not None:
             image = self.transform(image)
         return image, torch.tensor(self.labels[idx], dtype=torch.float32)
+
+    def _load_image(self, path: Path) -> np.ndarray:
+        with Image.open(path) as image:
+            image = image.convert("L") if self.greyscale else image.convert("RGB")
+            image = image.resize((4096, 256), resample=Image.Resampling.BILINEAR)
+            if self.greyscale:
+                image = ImageOps.equalize(image)
+                return np.asarray(image, dtype=np.float32) / 255.0
+
+            return np.asarray(image, dtype=np.float32) / 255.0
+
+    def _load_mask(self, path: Path) -> np.ndarray:
+        with Image.open(path) as mask:
+            mask = mask.convert("L")
+            mask_array = np.asarray(mask, dtype=np.uint8)
+        return (mask_array > 0).astype(np.uint8)
+
+    def _resize_mask(self, mask: np.ndarray) -> np.ndarray:
+        pil_mask = Image.fromarray(mask * 255)
+        resized = pil_mask.resize((4096, 256), resample=Image.Resampling.NEAREST)
+        return (np.asarray(resized, dtype=np.uint8) > 0).astype(np.uint8)
+
+    @staticmethod
+    def _is_artifact(path: Path) -> bool:
+        return path.name.startswith("._")
+
+
+class AITEXSegmentationPatchDataset(Dataset):
+    """AITEX defect-only patches for binary segmentation."""
+
+    image_dims = (256, 4096)
+    patch_size = 256
+
+    def __init__(self, aitex_dir: str | Path, transform=None):
+        self.aitex_dir = Path(aitex_dir)
+        self.transform = transform
+        self.classification_view = AITEXPatchDataset(aitex_dir, transform=None, greyscale=True)
+
+        self.images: list[torch.Tensor] = []
+        self.masks: list[torch.Tensor] = []
+        self.source_paths: list[str] = []
+        self.patch_indices: list[int] = []
+
+        for image_path, mask in zip(
+            self.classification_view.image_paths,
+            self.classification_view.masks,
+        ):
+            image_resized = self.classification_view._load_image(Path(image_path))
+            mask_resized = self.classification_view._resize_mask(mask)
+            for patch_idx, start in enumerate(range(0, 4096, self.patch_size)):
+                image_patch = image_resized[:, start : start + self.patch_size]
+                mask_patch = mask_resized[:, start : start + self.patch_size]
+                if mask_patch.sum() == 0:
+                    continue
+                self.images.append(torch.tensor(image_patch, dtype=torch.float32).reshape(1, 256, 256))
+                self.masks.append(torch.tensor(mask_patch, dtype=torch.float32).reshape(1, 256, 256))
+                self.source_paths.append(str(image_path))
+                self.patch_indices.append(patch_idx)
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __getitem__(self, idx: int):
+        image = self.images[idx]
+        mask = self.masks[idx]
+        if self.transform is not None:
+            image = self.transform(image)
+            mask = self.transform(mask)
+        return image, mask
 
 
 def make_splits(dataset: Dataset, train_fraction: float = 0.95, seed: Optional[int] = 42) -> DatasetSplits:
